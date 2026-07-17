@@ -8,6 +8,7 @@
 
 #include "ApplicationMessageHandling.h"
 
+#include "FileItem.h"
 #include "FileItemList.h"
 #include "GUIInfoManager.h"
 #include "GUIUserMessages.h"
@@ -104,6 +105,9 @@ CApplicationMessageHandling::CApplicationMessageHandling(CApplication& app)
     m_app(app)
 {
 }
+
+// Out-of-line so std::unique_ptr<CFileItem> only needs a forward declaration in the header.
+CApplicationMessageHandling::~CApplicationMessageHandling() = default;
 
 void CApplicationMessageHandling::OnApplicationMessage(MESSAGING::ThreadMessage* pMsg)
 {
@@ -223,7 +227,21 @@ void CApplicationMessageHandling::OnApplicationMessage(MESSAGING::ThreadMessage*
 
       *static_cast<bool*>(pMsg->lpVoid) = displaySetup;
       if (displaySetup)
+      {
         m_app.GetComponent<CApplicationPowerHandling>()->SetRenderGUI(true);
+
+        // Resume the video that was playing when the surface was destroyed (see
+        // TMSG_DISPLAY_DESTROY), at the same position. The start offset and the saved player
+        // state carried on the item restore the exact position without a resume dialog. Re-post
+        // as a play request so it runs after this message returns and the GUI is fully back
+        // (the item's heap copy is owned and freed by the TMSG_MEDIA_PLAY handler).
+        if (m_androidResumeItem)
+        {
+          CServiceBroker::GetAppMessenger()->PostMsg(
+              TMSG_MEDIA_PLAY, 0, 0, static_cast<void*>(new CFileItem(*m_androidResumeItem)));
+          m_androidResumeItem.reset();
+        }
+      }
       break;
     }
 
@@ -242,6 +260,22 @@ void CApplicationMessageHandling::OnApplicationMessage(MESSAGING::ThreadMessage*
         const int activeWindow = windowManager.GetActiveWindow();
         if (activeWindow == WINDOW_FULLSCREEN_VIDEO || activeWindow == WINDOW_FULLSCREEN_GAME)
           windowManager.ActivateWindow(WINDOW_HOME);
+      }
+
+      // Capture the video playing on this surface so it can be resumed at the same position
+      // once the surface comes back (see TMSG_DISPLAY_SETUP). ClosePlayer() below tears the
+      // player down completely - Android destroys the surface on screen lock, PiP/rotation and
+      // incoming calls - so remember the item, position and exact player state now. Mirrors
+      // CPowerManager::StorePlayerState() used for sleep/wake resume.
+      if (appPlayer->IsPlayingVideo())
+      {
+        m_androidResumeItem = std::make_unique<CFileItem>(m_app.CurrentFileItem());
+        m_androidResumeItem->SetStartOffset(appPlayer->GetTime());
+        m_androidResumeItem->SetProperty("savedplayerstate", appPlayer->GetPlayerState());
+      }
+      else
+      {
+        m_androidResumeItem.reset();
       }
 
       m_app.GetComponent<CApplicationPlayer>()->ClosePlayer();
