@@ -282,7 +282,10 @@ void CXBMCApp::onStart()
     registerReceiver(*this, intentFilter);
     m_mediaSession = std::make_unique<CJNIXBMCMediaSession>();
     m_pipSupported = supportsPip();
-    CLog::Log(LOGINFO, "CXBMCApp: PiP supported by device: {}", m_pipSupported ? "yes" : "no");
+    // onStart() runs before XBMC_Run() brings up the logging subsystem, so this
+    // must use android_printf like the rest of this function - a CLog call here
+    // dereferences an uninitialised logger and crashes on startup.
+    android_printf("CXBMCApp: PiP supported by device: %s", m_pipSupported ? "yes" : "no");
     m_inputHandler.setDPI(GetDPI());
     runNativeOnUiThread(RegisterDisplayListenerCallback, nullptr);
   }
