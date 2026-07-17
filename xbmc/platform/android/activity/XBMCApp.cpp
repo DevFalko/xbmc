@@ -1700,10 +1700,21 @@ void CXBMCApp::onDisplayChanged(int displayId)
     // Display mode has been changed during app startup; we want to reset audio engine on next ACTION_HDMI_AUDIO_PLUG event
     m_aeReset = true;
 
-  // Update display modes
-  CWinSystemAndroid* winSystemAndroid = dynamic_cast<CWinSystemAndroid*>(CServiceBroker::GetWinSystem());
-  if (winSystemAndroid)
-    winSystemAndroid->UpdateDisplayModes();
+  // Update display modes - but only while the surface still exists. onDisplayChanged is
+  // dispatched on the UI thread, and UpdateDisplayModes() probes the resolution via
+  // CXBMCApp::GetNativeWindow(), which blocks for up to 30s waiting for a surface. If a display
+  // event arrives while the surface is gone - a screen lock/unlock, a PiP or rotation
+  // transition, or an incoming call tearing playback down - that wait freezes the UI thread and
+  // Android kills the app with an ANR (black, unresponsive window). The surface-recreation path
+  // re-probes the resolution via surfaceCreated() -> XBMC_SetupDisplay(), so deferring here
+  // loses nothing.
+  if (m_window)
+  {
+    CWinSystemAndroid* winSystemAndroid =
+        dynamic_cast<CWinSystemAndroid*>(CServiceBroker::GetWinSystem());
+    if (winSystemAndroid)
+      winSystemAndroid->UpdateDisplayModes();
+  }
 
   m_displayChangeEvent.Set();
   m_inputHandler.setDPI(GetDPI());
