@@ -685,6 +685,16 @@ bool CXBMCApp::XBMC_DestroyDisplay()
   bool result;
   CServiceBroker::GetAppMessenger()->SendMsg(TMSG_DISPLAY_DESTROY, -1, -1,
                                              static_cast<void*>(&result));
+
+  // TMSG_DISPLAY_DESTROY force-closes the player because the surface is gone. That teardown
+  // goes through CApplicationPlayer::ClosePlayer(), which drops the asynchronous OnStop
+  // notification - so the Player.OnStop announcement never arrives and OnPlayBackStopped()
+  // never runs. The MediaSession is then left active and PLAYING with no player behind it,
+  // which leaves a dead "now playing" tile with greyed controls after the window is closed.
+  // Reconcile the session with the real (stopped) player state here.
+  if (m_playback_state != PLAYBACK_STATE_STOPPED)
+    OnPlayBackStopped();
+
   return result;
 }
 
@@ -874,6 +884,15 @@ void CXBMCApp::UpdateSessionState()
     else
       m_playback_state &= ~PLAYBACK_STATE_AUDIO;
 
+    // Re-evaluate pausability live. OnPlayBackStarted latches CANNOT_PAUSE from CanPause()
+    // before the player is fully initialised, so a pausable stream can start out flagged as
+    // non-pausable - which drops the play/pause control from the system media UI until some
+    // later event happens to refresh the session. Recompute it here like the video/audio bits.
+    if (appPlayer->CanPause())
+      m_playback_state &= ~PLAYBACK_STATE_CANNOT_PAUSE;
+    else
+      m_playback_state |= PLAYBACK_STATE_CANNOT_PAUSE;
+
     pos = appPlayer->GetTime();
     speed = appPlayer->GetPlaySpeed();
 
@@ -887,8 +906,42 @@ void CXBMCApp::UpdateSessionState()
 
   if ((oldPlayState != m_playback_state) || !m_mediaSessionUpdated)
   {
-    builder.setState(state, pos, speed, CJNISystemClock::elapsedRealtime())
-        .setActions(CJNIPlaybackState::PLAYBACK_POSITION_UNKNOWN);
+    // Advertise the transport controls Kodi actually handles (see CJNIXBMCMediaSession).
+    // The value passed here was PLAYBACK_POSITION_UNKNOWN (-1) - a position constant, not an
+    // action mask - so every bit including reserved ones was set. System media controls
+    // (notification, PiP on API 31+, Android Auto) derive their buttons from this mask paired
+    // with the state; advertise a precise, state-appropriate set instead.
+    //
+    // The androidjni binding comments its ACTION_* constants out because the names clash with
+    // Kodi's internal ActionIDs.h macros, so mirror the (ABI-stable) android.media.session.
+    // PlaybackState flag values directly here.
+    constexpr int64_t ACTION_MEDIA_STOP = 1LL << 0;
+    constexpr int64_t ACTION_MEDIA_PAUSE = 1LL << 1;
+    constexpr int64_t ACTION_MEDIA_PLAY = 1LL << 2;
+    constexpr int64_t ACTION_MEDIA_REWIND = 1LL << 3;
+    constexpr int64_t ACTION_MEDIA_SKIP_TO_PREVIOUS = 1LL << 4;
+    constexpr int64_t ACTION_MEDIA_SKIP_TO_NEXT = 1LL << 5;
+    constexpr int64_t ACTION_MEDIA_FAST_FORWARD = 1LL << 6;
+    constexpr int64_t ACTION_MEDIA_SEEK_TO = 1LL << 8;
+    constexpr int64_t ACTION_MEDIA_PLAY_PAUSE = 1LL << 9;
+
+    int64_t actions = 0;
+    if (state != CJNIPlaybackState::STATE_STOPPED)
+    {
+      actions = ACTION_MEDIA_STOP | ACTION_MEDIA_SEEK_TO | ACTION_MEDIA_FAST_FORWARD |
+                ACTION_MEDIA_REWIND | ACTION_MEDIA_SKIP_TO_NEXT | ACTION_MEDIA_SKIP_TO_PREVIOUS;
+
+      if (!(m_playback_state & PLAYBACK_STATE_CANNOT_PAUSE))
+      {
+        actions |= ACTION_MEDIA_PLAY_PAUSE;
+        if (state == CJNIPlaybackState::STATE_PLAYING)
+          actions |= ACTION_MEDIA_PAUSE;
+        else
+          actions |= ACTION_MEDIA_PLAY;
+      }
+    }
+
+    builder.setState(state, pos, speed, CJNISystemClock::elapsedRealtime()).setActions(actions);
     m_mediaSession->updatePlaybackState(builder.build());
     m_mediaSessionUpdated = true;
   }
@@ -961,8 +1014,11 @@ std::vector<int> CXBMCApp::GetInputDeviceIds()
 
 void CXBMCApp::ProcessSlow()
 {
-  if ((m_playback_state & PLAYBACK_STATE_PLAYING) && !m_mediaSessionUpdated &&
-      m_mediaSession->isActive())
+  // Poll the session state while playing so a late-settling capability (e.g. pausability,
+  // see UpdateSessionState) is picked up. UpdateSessionState only pushes to the framework
+  // when a tracked bit actually changed, so calling it every slow tick is cheap and does not
+  // spam JNI once the state has stabilised.
+  if ((m_playback_state & PLAYBACK_STATE_PLAYING) && m_mediaSession->isActive())
     UpdateSessionState();
 }
 
