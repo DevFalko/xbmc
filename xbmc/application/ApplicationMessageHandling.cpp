@@ -230,6 +230,20 @@ void CApplicationMessageHandling::OnApplicationMessage(MESSAGING::ThreadMessage*
     case TMSG_DISPLAY_DESTROY:
     {
       m_app.GetComponent<CApplicationPowerHandling>()->SetRenderGUI(false);
+
+      // Leave a fullscreen playback window while the player is still alive. ClosePlayer()
+      // below drops the player without telling the GUI, and the skin reload on resume only
+      // leaves that window while IsPlayingVideo() still holds (see
+      // CApplicationSkinHandling::LoadSkin) - by then there is no player left to detect, so
+      // the window gets saved and restored with nothing behind it and renders black.
+      if (CGUIComponent* gui = CServiceBroker::GetGUI(); gui)
+      {
+        CGUIWindowManager& windowManager = gui->GetWindowManager();
+        const int activeWindow = windowManager.GetActiveWindow();
+        if (activeWindow == WINDOW_FULLSCREEN_VIDEO || activeWindow == WINDOW_FULLSCREEN_GAME)
+          windowManager.ActivateWindow(WINDOW_HOME);
+      }
+
       m_app.GetComponent<CApplicationPlayer>()->ClosePlayer();
 
       if (CGUIComponent* gui = CServiceBroker::GetGUI(); gui && gui->GetSkinInfo())
