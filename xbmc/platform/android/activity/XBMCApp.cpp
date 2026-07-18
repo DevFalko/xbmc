@@ -360,7 +360,8 @@ void CXBMCApp::onPause()
   {
     if (appPlayer->HasVideo())
     {
-      if (!appPlayer->IsPaused() && !m_hasReqVisible)
+      // In survive-surface-loss mode keep playing across the screen lock (do not auto-pause).
+      if (!appPlayer->IsPaused() && !m_hasReqVisible && !IsSurvivingSurfaceLoss())
       {
         CServiceBroker::GetAppMessenger()->SendMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
                                                    static_cast<void*>(new CAction(ACTION_PAUSE)));
@@ -386,7 +387,8 @@ void CXBMCApp::onStop()
 {
   android_printf("CXBMCApp::%s", __FUNCTION__);
 
-  if ((m_playback_state & PLAYBACK_STATE_PLAYING) && !m_hasReqVisible)
+  // In survive-surface-loss mode keep playing across the screen lock (do not stop or pause).
+  if ((m_playback_state & PLAYBACK_STATE_PLAYING) && !m_hasReqVisible && !IsSurvivingSurfaceLoss())
   {
     if (m_playback_state & PLAYBACK_STATE_CANNOT_PAUSE)
       CServiceBroker::GetAppMessenger()->SendMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
@@ -1331,9 +1333,36 @@ void CXBMCApp::onReceive(CJNIIntent intent)
   }
 }
 
+bool CXBMCApp::IsSurvivingSurfaceLoss()
+{
+  const auto& components = CServiceBroker::GetAppComponents();
+  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+  return appPlayer && appPlayer->IsPlayingVideo() &&
+         CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+             CSettings::SETTING_VIDEOPLAYER_ANDROIDSURVIVESURFACELOSS);
+}
+
 void CXBMCApp::OnSleep()
 {
   CLog::Log(LOGDEBUG, "CXBMCApp::OnSleep");
+
+  // Survive-surface-loss kill-switch (experimental, default off): a screen-off on Android maps to
+  // the cross-platform power OnSleep(), which stores the player state and calls StopPlaying() (plus
+  // suspends the audio engine and closes network shares). That tears the player down just like the
+  // save/resume path and defeats keeping it alive across the surface loss. When the kill-switch is
+  // on and video is playing, skip the power sleep entirely so player, audio engine and network stay
+  // up; the paused decoder rebinds its surface on TMSG_DISPLAY_SETUP. OnWakeup() mirrors this and
+  // skips the matching resume (see m_powerSleepSuppressedForSurvive).
+  if (IsSurvivingSurfaceLoss())
+  {
+    m_powerSleepSuppressedForSurvive = true;
+    CLog::Log(LOGINFO,
+              "CXBMCApp::OnSleep: survive-surface-loss active, keeping player alive (skip power "
+              "sleep)");
+    return;
+  }
+  m_powerSleepSuppressedForSurvive = false;
+
   IPowerSyscall* syscall = CServiceBroker::GetPowerManager().GetPowerSyscall();
   if (syscall)
     static_cast<CAndroidPowerSyscall*>(syscall)->SetSuspended();
@@ -1342,9 +1371,22 @@ void CXBMCApp::OnSleep()
 void CXBMCApp::OnWakeup()
 {
   CLog::Log(LOGDEBUG, "CXBMCApp::OnWakeup");
-  IPowerSyscall* syscall = CServiceBroker::GetPowerManager().GetPowerSyscall();
-  if (syscall)
-    static_cast<CAndroidPowerSyscall*>(syscall)->SetResumed();
+
+  // If OnSleep() suppressed the power sleep to keep the player alive across the surface loss, we
+  // never entered the suspended state - so skip the matching resume (SetResumed() would fire a
+  // stray CPowerManager::OnWake() that restores a player state we never stored). The screen saver
+  // is still woken below.
+  if (m_powerSleepSuppressedForSurvive)
+  {
+    m_powerSleepSuppressedForSurvive = false;
+    CLog::Log(LOGINFO, "CXBMCApp::OnWakeup: survive-surface-loss resume, skip power wake");
+  }
+  else
+  {
+    IPowerSyscall* syscall = CServiceBroker::GetPowerManager().GetPowerSyscall();
+    if (syscall)
+      static_cast<CAndroidPowerSyscall*>(syscall)->SetResumed();
+  }
 
   if (HasFocus())
   {
@@ -1453,7 +1495,8 @@ void CXBMCApp::onAudioFocusChange(int focusChange)
   android_printf("Audio Focus changed: %d", focusChange);
   if (focusChange == CJNIAudioManager::AUDIOFOCUS_LOSS)
   {
-    if ((m_playback_state & PLAYBACK_STATE_PLAYING))
+    // In survive-surface-loss mode a screen lock briefly drops audio focus; keep playing.
+    if ((m_playback_state & PLAYBACK_STATE_PLAYING) && !IsSurvivingSurfaceLoss())
     {
       if (m_playback_state & PLAYBACK_STATE_CANNOT_PAUSE)
         CServiceBroker::GetAppMessenger()->SendMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,

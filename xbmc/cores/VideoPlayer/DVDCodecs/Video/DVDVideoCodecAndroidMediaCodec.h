@@ -129,6 +129,10 @@ protected:
   void InjectExtraData(CJNIMediaFormat& mediaformat);
   std::vector<uint8_t> GetHDRStaticMetadata();
   bool ConfigureMediaCodec(void);
+  // Rebind a surface created after a survive-surface-loss on the decode thread (see m_surfaceLost).
+  void ApplyPendingSurfaceRebind();
+  // Recover after the system reclaimed (released) the codec during a survive-surface-loss lock.
+  void RecreateReclaimedCodec();
   int GetOutputPicture(void);
   void ConfigureOutputFormat(CJNIMediaFormat& mediaformat);
   void UpdateFpsDuration();
@@ -168,6 +172,17 @@ protected:
 
   int m_indexInputBuffer;
   bool m_render_surface;
+  // Survive-surface-loss (seamless resume across a screen lock): the codec is kept running while
+  // the surface is gone (m_surfaceLost). surfaceDestroyed() (Android UI thread) sets m_surfaceLost;
+  // surfaceCreated() (Android UI thread) stashes the new surface and flags a rebind; the decode
+  // thread applies MediaCodec.setOutputSurface() itself at the top of GetPicture()/AddData() so all
+  // codec access stays on one thread (MediaCodec is not thread-safe). While m_surfaceLost is set the
+  // decode thread produces no output (nothing is rendered to the invalid surface). m_surfaceLost and
+  // m_surfaceRebindPending are atomic because they are written on the UI thread and read/written on
+  // the decode thread; the atomic store/exchange also publishes m_pendingSurface across threads.
+  std::atomic<bool> m_surfaceLost{false};
+  std::atomic<bool> m_surfaceRebindPending{false};
+  CJNISurface m_pendingSurface;
   mpeg2_sequence* m_mpeg2_sequence = nullptr;
   bool m_useDTSforPTS = false;
 

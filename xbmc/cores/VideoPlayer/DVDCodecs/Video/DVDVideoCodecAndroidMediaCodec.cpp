@@ -1009,6 +1009,11 @@ bool CDVDVideoCodecAndroidMediaCodec::AddData(const DemuxPacket &packet)
   if (!m_opened || m_state == MEDIACODEC_STATE_STOPPED)
     return false;
 
+  // Seamless survive-surface-loss: apply a pending surface rebind here, on the decode thread,
+  // before any codec access (see ApplyPendingSurfaceRebind / m_surfaceLost).
+  if (m_surfaceRebindPending)
+    ApplyPendingSurfaceRebind();
+
   double pts(packet.pts), dts(packet.dts);
 
   if (CServiceBroker::GetLogging().CanLogComponent(LOGVIDEO))
@@ -1256,6 +1261,14 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecAndroidMediaCodec::GetPicture(VideoPictur
 {
   if (!m_opened)
     return VC_NONE;
+
+  // Seamless survive-surface-loss: rebind a newly created surface here, on the decode thread.
+  if (m_surfaceRebindPending)
+    ApplyPendingSurfaceRebind();
+  // While the surface is gone (screen locked, codec kept alive) produce no output so nothing is
+  // rendered to an invalid surface; keep accepting input so the pipeline does not stall.
+  if (m_surfaceLost)
+    return VC_BUFFER;
 
   if (m_state == MEDIACODEC_STATE_ERROR || m_state == MEDIACODEC_STATE_ENDOFSTREAM)
     return VC_EOF;
@@ -1897,20 +1910,201 @@ void CDVDVideoCodecAndroidMediaCodec::surfaceChanged(CJNISurfaceHolder holder, i
 
 void CDVDVideoCodecAndroidMediaCodec::surfaceCreated(CJNISurfaceHolder holder)
 {
-  if (m_state == MEDIACODEC_STATE_STOPPED)
+  if (m_surfaceLost)
   {
-    ConfigureMediaCodec();
+    // Seamless resume: hand the freshly created surface to the decode thread, which rebinds it in
+    // place (MediaCodec.setOutputSurface) at the top of GetPicture()/AddData(). We must NOT touch
+    // the codec from this (Android UI) thread - MediaCodec is not thread-safe and the decode thread
+    // may already be running again (OnResetDisplay unpauses it), which is exactly the race that
+    // made a direct setOutputSurface() here fail intermittently.
+    if (m_jnivideoview)
+    {
+      m_pendingSurface = m_jnivideoview->getSurface();
+      if (m_pendingSurface)
+        m_surfaceRebindPending = true;
+      else
+        CLog::Log(LOGERROR, "CDVDVideoCodecAndroidMediaCodec::surfaceCreated: getSurface failed");
+    }
+    return;
   }
+
+  if (m_state == MEDIACODEC_STATE_STOPPED)
+    ConfigureMediaCodec();
+}
+
+namespace
+{
+// Read and clear a pending JNI exception, returning its toString() text for logging.
+std::string GetAndClearJniException(JNIEnv* env)
+{
+  jthrowable exc = env->ExceptionOccurred();
+  env->ExceptionClear();
+  std::string text = "<no message>";
+  if (exc)
+  {
+    jclass excCls = env->GetObjectClass(exc);
+    jmethodID toString = env->GetMethodID(excCls, "toString", "()Ljava/lang/String;");
+    if (toString)
+    {
+      jstring js = static_cast<jstring>(env->CallObjectMethod(exc, toString));
+      if (js)
+      {
+        const char* cs = env->GetStringUTFChars(js, nullptr);
+        if (cs)
+        {
+          text = cs;
+          env->ReleaseStringUTFChars(js, cs);
+        }
+        env->DeleteLocalRef(js);
+      }
+    }
+    env->DeleteLocalRef(excCls);
+    env->DeleteLocalRef(exc);
+  }
+  return text;
+}
+} // namespace
+
+void CDVDVideoCodecAndroidMediaCodec::ApplyPendingSurfaceRebind()
+{
+  // Runs on the decode thread (GetPicture/AddData), serialized with all other codec access.
+  if (!m_surfaceRebindPending.exchange(false))
+    return;
+
+  m_jnivideosurface = m_pendingSurface;
+  // Don't pin the surface after consuming it.
+  m_pendingSurface = CJNISurface(jni::jhobject(nullptr));
+
+  JNIEnv* env = xbmc_jnienv();
+  jobject codecObj = m_codec ? m_codec->get_raw() : nullptr;
+  if (!codecObj || !m_jnivideosurface)
+  {
+    CLog::Log(LOGERROR, "CDVDVideoCodecAndroidMediaCodec: cannot rebind surface, codec gone");
+    m_state = MEDIACODEC_STATE_ERROR;
+    m_surfaceLost = false;
+    return;
+  }
+
+  bool rebound = false;
+  jclass cls = env->GetObjectClass(codecObj);
+  // MediaCodec.setOutputSurface() is not exposed by libandroidjni; call it directly via JNI.
+  jmethodID mid = env->GetMethodID(cls, "setOutputSurface", "(Landroid/view/Surface;)V");
+  if (mid)
+  {
+    // get_raw() returns a jni::jhobject holder; convert to a plain jobject before passing it
+    // through the variadic CallVoidMethod (the holder cannot cross a variadic boundary).
+    jobject surfaceObj = m_jnivideosurface.get_raw();
+    env->CallVoidMethod(codecObj, mid, surfaceObj);
+    if (env->ExceptionCheck())
+    {
+      CLog::Log(LOGWARNING, "CDVDVideoCodecAndroidMediaCodec: setOutputSurface failed: {}",
+                GetAndClearJniException(env));
+    }
+    else
+    {
+      rebound = true;
+      CLog::Log(LOGDEBUG, "CDVDVideoCodecAndroidMediaCodec: surface rebound via setOutputSurface");
+    }
+  }
+  else
+  {
+    // Method lookup itself raised (e.g. NoSuchMethodError) - clear it so it does not leak into the
+    // next JNI call on this thread.
+    env->ExceptionClear();
+    CLog::Log(LOGERROR, "CDVDVideoCodecAndroidMediaCodec: setOutputSurface unavailable");
+  }
+  env->DeleteLocalRef(cls);
+
+  m_surfaceLost = false;
+
+  // If the surface could not be rebound the system reclaimed (released) the decoder while the
+  // screen was locked - e.g. the lock-screen video wallpaper competes for the hardware codec.
+  // setOutputSurface() cannot recover a released codec, so re-create it in place. This is not a
+  // seamless swap: playback resumes from the next keyframe (brief re-buffer), which is the best
+  // achievable once the decoder has been taken away.
+  if (!rebound)
+  {
+    CLog::Log(LOGINFO, "CDVDVideoCodecAndroidMediaCodec: surface rebind failed, recreating codec");
+    RecreateReclaimedCodec();
+  }
+}
+
+void CDVDVideoCodecAndroidMediaCodec::RecreateReclaimedCodec()
+{
+  // Runs on the decode thread. The old MediaCodec is already in the Released state (reclaimed by
+  // the system); drop the wrapper without calling stop()/release() on it (those would throw).
+  m_codec = nullptr;
+
+  m_codec = std::make_shared<CJNIMediaCodec>(CJNIMediaCodec::createByCodecName(m_codecname));
+  if (xbmc_jnienv()->ExceptionCheck())
+  {
+    xbmc_jnienv()->ExceptionDescribe();
+    xbmc_jnienv()->ExceptionClear();
+    m_codec = nullptr;
+  }
+  if (!m_codec)
+  {
+    CLog::Log(LOGERROR, "CDVDVideoCodecAndroidMediaCodec::RecreateReclaimedCodec: create failed");
+    m_state = MEDIACODEC_STATE_ERROR;
+    return;
+  }
+
+  // The buffer pool holds a reference to the codec; give it the new one. Swapping the pool is safe
+  // here because the seamless surfaceDestroyed() already released all renderer-held buffers and
+  // GetPicture() hands out no new buffers while m_surfaceLost is set, so no CMediaCodecVideoBuffer
+  // referencing the old (released) codec/pool is in flight at this point.
+  m_videoBufferPool = std::make_shared<CMediaCodecVideoBufferPool>(m_codec);
+
+  // ConfigureMediaCodec() re-fetches the surface from the video view, configures and starts the
+  // new codec and leaves it in MEDIACODEC_STATE_FLUSHED, ready to decode from the next keyframe.
+  if (!ConfigureMediaCodec())
+  {
+    CLog::Log(LOGERROR,
+              "CDVDVideoCodecAndroidMediaCodec::RecreateReclaimedCodec: configure failed");
+    m_state = MEDIACODEC_STATE_ERROR;
+  }
+  else
+    CLog::Log(LOGINFO, "CDVDVideoCodecAndroidMediaCodec: reclaimed codec recreated");
 }
 
 void CDVDVideoCodecAndroidMediaCodec::surfaceDestroyed(CJNISurfaceHolder holder)
 {
-  if (m_state != MEDIACODEC_STATE_STOPPED && m_state != MEDIACODEC_STATE_UNINITIALIZED)
+  if (m_state == MEDIACODEC_STATE_STOPPED || m_state == MEDIACODEC_STATE_UNINITIALIZED)
+    return;
+
+  // Seamless survive-surface-loss path (kill-switch, surface render mode, API 23+): keep the codec
+  // running and only detach from the dying surface. surfaceCreated() rebinds the freshly created
+  // surface in place with MediaCodec.setOutputSurface(), preserving all decoder state so playback
+  // resumes with no re-buffer and no keyframe wait. Otherwise fall back to the default stop +
+  // reconfigure-on-create behaviour (also used for rotation / resolution changes).
+  const bool seamless = m_render_surface && m_codec && CJNIBase::GetSDKVersion() >= 23 &&
+                        CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+                            CSettings::SETTING_VIDEOPLAYER_ANDROIDSURVIVESURFACELOSS);
+
+  if (seamless)
   {
-    m_state = MEDIACODEC_STATE_STOPPED;
-    if (m_jnivideosurface)
-      m_jnivideosurface.release();
-    m_codec->stop();
-    xbmc_jnienv()->ExceptionClear();
+    // Publish the surface-lost state first (atomic) so the decode thread stops producing output
+    // immediately, then release the renderer-held output buffers (under the pool lock) so nothing
+    // is rendered to the now invalid surface. Do NOT touch m_jnivideosurface here - it is owned by
+    // the decode thread, which overwrites it when it rebinds the new surface in
+    // ApplyPendingSurfaceRebind(). The pool keeps its codec reference so buffers decoded after the
+    // rebind are released normally.
+    m_surfaceLost = true;
+    if (m_videoBufferPool)
+      m_videoBufferPool->ReleaseMediaCodecBuffers();
+    return;
   }
+
+  m_state = MEDIACODEC_STATE_STOPPED;
+  // Release any output buffers still held by the renderer WHILE the codec is still executing,
+  // and drop the pool's codec reference. Otherwise, when the player is kept alive across a
+  // surface loss (screen lock), a later CMediaCodecVideoBuffer::ReleaseOutputBuffer would call
+  // releaseOutputBuffer() on the now-stopped codec -> IllegalStateException and a frozen
+  // picture. Mirrors the ordering in Dispose() (release buffers before stop()).
+  if (m_videoBufferPool)
+    m_videoBufferPool->ResetMediaCodec();
+  if (m_jnivideosurface)
+    m_jnivideosurface.release();
+  m_codec->stop();
+  xbmc_jnienv()->ExceptionClear();
 }

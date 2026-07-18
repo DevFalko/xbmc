@@ -43,6 +43,12 @@ public:
   bool IsHdmiModeTriggered() const { return m_HdmiModeTriggered; }
   void SetHdmiState(bool connected);
 
+  // Fan out a display-lost/reset to registered IDispResource clients (e.g. CVideoPlayer)
+  // WITHOUT the HDMI-plug/refresh-rate timer bookkeeping that SetHdmiState carries. Used by
+  // the surface-loss survival path (screen lock) to pause/resume playback in place.
+  void NotifyDisplayLost();
+  void NotifyDisplayReset();
+
   void UpdateDisplayModes();
 
   bool HasCursor() override { return false; }

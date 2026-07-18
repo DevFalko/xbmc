@@ -94,6 +94,12 @@ public:
   static CXBMCApp& Get() { return *m_appinstance; }
   static void Destroy() { m_appinstance.reset(); }
 
+  // True when the survive-surface-loss kill-switch is on and video is playing. In that mode the
+  // Android background/focus lifecycle (onPause/onStop/audio-focus-loss/media-session stop, power
+  // OnSleep) must NOT stop or pause playback - the player is deliberately kept alive across the
+  // screen lock and resumes in place when the surface returns.
+  static bool IsSurvivingSurfaceLoss();
+
   CXBMCApp() = delete;
   ~CXBMCApp() override;
 
@@ -244,6 +250,9 @@ private:
   bool m_wakeUp{false};
   bool m_aeReset{false};
   bool m_hdmiPlugged{true};
+  // Set in OnSleep() when the survive-surface-loss kill-switch keeps the player alive across a
+  // screen-off, so OnWakeup() knows to skip the matching power resume (we never suspended).
+  bool m_powerSleepSuppressedForSurvive{false};
   bool m_mediaSessionUpdated{false};
   IInputDeviceCallbacks* m_inputDeviceCallbacks{nullptr};
   IInputDeviceEventHandler* m_inputDeviceEventHandler{nullptr};

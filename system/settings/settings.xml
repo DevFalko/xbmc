@@ -170,6 +170,15 @@
           </updates>
           <control type="toggle" />
         </setting>
+        <!-- Experimental Android kill-switch: keep the player alive across a surface loss
+             (screen lock) instead of closing + re-opening. Default off; falls back to the
+             normal teardown + save/resume on failure. label/help are placeholders (dev). -->
+        <setting id="videoplayer.androidsurvivesurfaceloss" type="boolean" label="13440" help="36544">
+          <requirement>HAS_MEDIACODEC</requirement>
+          <level>4</level>
+          <default>false</default>
+          <control type="toggle" />
+        </setting>
         <setting id="videoplayer.usemediacodec" type="boolean" label="13439" help="36544">
           <requirement>HAS_MEDIACODEC</requirement>
           <level>2</level>

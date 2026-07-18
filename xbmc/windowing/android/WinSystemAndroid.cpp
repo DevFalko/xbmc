@@ -267,6 +267,22 @@ void CWinSystemAndroid::SetHdmiState(bool connected)
   }
 }
 
+void CWinSystemAndroid::NotifyDisplayLost()
+{
+  std::unique_lock lock(m_resourceSection);
+  CLog::Log(LOGDEBUG, "CWinSystemAndroid::NotifyDisplayLost");
+  for (auto resource : m_resources)
+    resource->OnLostDisplay();
+}
+
+void CWinSystemAndroid::NotifyDisplayReset()
+{
+  std::unique_lock lock(m_resourceSection);
+  CLog::Log(LOGDEBUG, "CWinSystemAndroid::NotifyDisplayReset");
+  for (auto resource : m_resources)
+    resource->OnResetDisplay();
+}
+
 void CWinSystemAndroid::UpdateDisplayModes()
 {
   // re-fetch display modes

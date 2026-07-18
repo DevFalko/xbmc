@@ -121,6 +121,11 @@ public:
   static constexpr auto SETTING_VIDEOPLAYER_USEMEDIACODEC = "videoplayer.usemediacodec";
   static constexpr auto SETTING_VIDEOPLAYER_USEMEDIACODECSURFACE =
       "videoplayer.usemediacodecsurface";
+  // Kill-switch (Android only, default off): keep the player alive across a surface loss
+  // (screen lock) and re-bind instead of closing + re-opening. Falls back to the normal
+  // teardown + save/resume on any failure. See the Android TMSG_DISPLAY_DESTROY/SETUP handlers.
+  static constexpr auto SETTING_VIDEOPLAYER_ANDROIDSURVIVESURFACELOSS =
+      "videoplayer.androidsurvivesurfaceloss";
   static constexpr auto SETTING_VIDEOPLAYER_USEDECODERFILTER = "videoplayer.usedecoderfilter";
   static constexpr auto SETTING_VIDEOPLAYER_USEVDPAU = "videoplayer.usevdpau";
   static constexpr auto SETTING_VIDEOPLAYER_USEVDPAUMIXER = "videoplayer.usevdpaumixer";

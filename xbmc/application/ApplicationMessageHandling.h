@@ -38,5 +38,8 @@ private:
   // lock, PiP/rotation, incoming call) so it can be resumed at the same position once the
   // surface and render system are back. See the TMSG_DISPLAY_DESTROY/SETUP handlers.
   std::unique_ptr<CFileItem> m_androidResumeItem;
+  // True while a surface loss is being survived in place (player kept alive + paused, kill-switch
+  // enabled) rather than closed. Set on TMSG_DISPLAY_DESTROY, consumed on TMSG_DISPLAY_SETUP.
+  bool m_androidSurviveSurfaceLossActive{false};
 #endif
 };

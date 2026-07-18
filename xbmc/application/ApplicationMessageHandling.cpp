@@ -228,15 +228,26 @@ void CApplicationMessageHandling::OnApplicationMessage(MESSAGING::ThreadMessage*
       *static_cast<bool*>(pMsg->lpVoid) = displaySetup;
       if (displaySetup)
       {
+        // Re-enable GUI rendering BEFORE resuming the player: CRenderManager::Configure is a
+        // no-op while render-GUI is off, so a picture arriving before this flag is set would be
+        // silently dropped and the video renderer would never reconfigure.
         m_app.GetComponent<CApplicationPowerHandling>()->SetRenderGUI(true);
 
-        // Resume the video that was playing when the surface was destroyed (see
-        // TMSG_DISPLAY_DESTROY), at the same position. The start offset and the saved player
-        // state carried on the item restore the exact position without a resume dialog. Re-post
-        // as a play request so it runs after this message returns and the GUI is fully back
-        // (the item's heap copy is owned and freed by the TMSG_MEDIA_PLAY handler).
-        if (m_androidResumeItem)
+        if (m_androidSurviveSurfaceLossActive)
         {
+          // Surface-loss survival path: the player was only paused (TMSG_DISPLAY_DESTROY). Fan
+          // the display-reset out via the shared IDispResource path to resume it in place - no
+          // re-open, no re-buffer.
+          m_androidSurviveSurfaceLossActive = false;
+          if (auto winSystem = dynamic_cast<CWinSystemAndroid*>(CServiceBroker::GetWinSystem()))
+            winSystem->NotifyDisplayReset();
+        }
+        else if (m_androidResumeItem)
+        {
+          // Save/resume fallback: the player was closed on destroy; re-open the same item at the
+          // saved position. The start offset + "savedplayerstate" restore the exact position
+          // without a resume dialog. Re-post so it runs after this message returns and the GUI
+          // is fully back (the heap copy is owned and freed by the TMSG_MEDIA_PLAY handler).
           CServiceBroker::GetAppMessenger()->PostMsg(
               TMSG_MEDIA_PLAY, 0, 0, static_cast<void*>(new CFileItem(*m_androidResumeItem)));
           m_androidResumeItem.reset();
@@ -249,36 +260,52 @@ void CApplicationMessageHandling::OnApplicationMessage(MESSAGING::ThreadMessage*
     {
       m_app.GetComponent<CApplicationPowerHandling>()->SetRenderGUI(false);
 
-      // Leave a fullscreen playback window while the player is still alive. ClosePlayer()
-      // below drops the player without telling the GUI, and the skin reload on resume only
-      // leaves that window while IsPlayingVideo() still holds (see
-      // CApplicationSkinHandling::LoadSkin) - by then there is no player left to detect, so
-      // the window gets saved and restored with nothing behind it and renders black.
-      if (CGUIComponent* gui = CServiceBroker::GetGUI(); gui)
-      {
-        CGUIWindowManager& windowManager = gui->GetWindowManager();
-        const int activeWindow = windowManager.GetActiveWindow();
-        if (activeWindow == WINDOW_FULLSCREEN_VIDEO || activeWindow == WINDOW_FULLSCREEN_GAME)
-          windowManager.ActivateWindow(WINDOW_HOME);
-      }
+      auto winSystem = dynamic_cast<CWinSystemAndroid*>(CServiceBroker::GetWinSystem());
 
-      // Capture the video playing on this surface so it can be resumed at the same position
-      // once the surface comes back (see TMSG_DISPLAY_SETUP). ClosePlayer() below tears the
-      // player down completely - Android destroys the surface on screen lock, PiP/rotation and
-      // incoming calls - so remember the item, position and exact player state now. Mirrors
-      // CPowerManager::StorePlayerState() used for sleep/wake resume.
-      if (appPlayer->IsPlayingVideo())
+      // Kill-switch (experimental, default off): keep the player alive across the surface loss
+      // (screen lock) and resume it in place on TMSG_DISPLAY_SETUP, instead of closing +
+      // re-opening (save/resume). CXBMCApp::IsSurvivingSurfaceLoss() is the single authority for
+      // "kill-switch on and video playing" (shared with the lifecycle/power handling); here we also
+      // require the Android WinSystem to fan the display-lost out to CVideoPlayer.
+      const bool surviveSurfaceLoss = winSystem && CXBMCApp::IsSurvivingSurfaceLoss();
+      m_androidSurviveSurfaceLossActive = surviveSurfaceLoss;
+
+      if (surviveSurfaceLoss)
       {
-        m_androidResumeItem = std::make_unique<CFileItem>(m_app.CurrentFileItem());
-        m_androidResumeItem->SetStartOffset(appPlayer->GetTime());
-        m_androidResumeItem->SetProperty("savedplayerstate", appPlayer->GetPlayerState());
+        // Pause playback in place and flush the renderer via the shared IDispResource path; the
+        // player, decoder and network stream stay alive (TMSG_DISPLAY_SETUP resumes them). In
+        // surface-render mode the video decoder scans out to its own XBMCVideoView surface and
+        // does no GL, so tearing down the GUI GL below does not touch the video path.
+        winSystem->NotifyDisplayLost();
+        m_androidResumeItem.reset();
       }
       else
       {
-        m_androidResumeItem.reset();
-      }
+        // Normal teardown. Leave a fullscreen playback window while the player is still alive
+        // (ClosePlayer drops it without telling the GUI -> black window on resume - see
+        // CApplicationSkinHandling::LoadSkin), then capture the item/position so it can be
+        // re-opened after the surface returns (save/resume, mirrors CPowerManager sleep/wake).
+        if (CGUIComponent* gui = CServiceBroker::GetGUI(); gui)
+        {
+          CGUIWindowManager& windowManager = gui->GetWindowManager();
+          const int activeWindow = windowManager.GetActiveWindow();
+          if (activeWindow == WINDOW_FULLSCREEN_VIDEO || activeWindow == WINDOW_FULLSCREEN_GAME)
+            windowManager.ActivateWindow(WINDOW_HOME);
+        }
 
-      m_app.GetComponent<CApplicationPlayer>()->ClosePlayer();
+        if (appPlayer->IsPlayingVideo())
+        {
+          m_androidResumeItem = std::make_unique<CFileItem>(m_app.CurrentFileItem());
+          m_androidResumeItem->SetStartOffset(appPlayer->GetTime());
+          m_androidResumeItem->SetProperty("savedplayerstate", appPlayer->GetPlayerState());
+        }
+        else
+        {
+          m_androidResumeItem.reset();
+        }
+
+        m_app.GetComponent<CApplicationPlayer>()->ClosePlayer();
+      }
 
       if (CGUIComponent* gui = CServiceBroker::GetGUI(); gui && gui->GetSkinInfo())
         m_androidSkinUnloadedForDisplayDestroy = true;
@@ -288,7 +315,6 @@ void CApplicationMessageHandling::OnApplicationMessage(MESSAGING::ThreadMessage*
       if (CRenderSystemBase* renderSystem = CServiceBroker::GetRenderSystem())
         renderSystem->DestroyRenderSystem();
 
-      auto winSystem = dynamic_cast<CWinSystemAndroid*>(CServiceBroker::GetWinSystem());
       *static_cast<bool*>(pMsg->lpVoid) = winSystem && winSystem->DestroySurface();
       break;
     }
